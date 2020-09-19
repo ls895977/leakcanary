@@ -167,6 +167,8 @@ class HprofIOPerfTest {
     assertThat(indexingReads).hasSameSizeAs(expectedReads).isEqualTo(expectedReads)
   }
 
+  // TODO Why did reads increase when we're not computing retained size?
+
   @Test fun `freeze leak_asynctask_o hprof random access metrics`() {
     val hprofFile = "leak_asynctask_o.hprof".classpathFile()
 
@@ -177,7 +179,7 @@ class HprofIOPerfTest {
     val medianBytesRead = randomAccessReads.median()
     val totalBytesRead = randomAccessReads.sum()
     assertThat(listOf(readsCount, medianBytesRead, totalBytesRead))
-        .isEqualTo(listOf(28596, 40.0, 1850100))
+        .isEqualTo(listOf(41595, 36.0, 2345760))
   }
 
   @Test fun `freeze leak_asynctask_m hprof random access metrics`() {
@@ -190,7 +192,7 @@ class HprofIOPerfTest {
     val medianBytesRead = randomAccessReads.median()
     val totalBytesRead = randomAccessReads.sum()
     assertThat(listOf(readsCount, medianBytesRead, totalBytesRead))
-        .isEqualTo(listOf(27205, 40.0, 2705654))
+        .isEqualTo(listOf(74586, 36.0, 4442687))
   }
 
   @Test fun `freeze leak_asynctask_pre_m hprof random access metrics`() {
@@ -202,7 +204,7 @@ class HprofIOPerfTest {
     val size = randomAccessReads.size
     val median = randomAccessReads.median()
     val sum = randomAccessReads.sum()
-    assertThat(listOf(size, median, sum)).isEqualTo(listOf(20079, 32.0, 1107595))
+    assertThat(listOf(size, median, sum)).isEqualTo(listOf(31378, 32.0, 1497400))
   }
 
   private fun trackAnalyzeIoReadMetrics(hprofFile: File): List<List<Int>> {

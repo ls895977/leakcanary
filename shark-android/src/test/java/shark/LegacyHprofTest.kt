@@ -156,7 +156,7 @@ class LegacyHprofTest {
             AndroidObjectInspectors.appLeakingObjectFilters
         ),
         referenceMatchers = AndroidReferenceMatchers.appDefaults,
-        computeRetainedHeapSize = false,
+        computeRetainedHeapSize = true,
         objectInspectors = AndroidObjectInspectors.appDefaults,
         metadataExtractor = AndroidMetadataExtractor
     )

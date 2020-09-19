@@ -42,6 +42,7 @@ import shark.ReferencePattern.NativeGlobalVariablePattern
 import shark.ReferencePattern.StaticFieldPattern
 import shark.SharkLog
 import shark.ValueHolder
+import shark.internal.ReferencePathNode.ChildNode
 import shark.internal.ReferencePathNode.ChildNode.LibraryLeakChildNode
 import shark.internal.ReferencePathNode.ChildNode.NormalNode
 import shark.internal.ReferencePathNode.LibraryLeakNode
@@ -49,7 +50,6 @@ import shark.internal.ReferencePathNode.RootNode
 import shark.internal.ReferencePathNode.RootNode.LibraryLeakRootNode
 import shark.internal.ReferencePathNode.RootNode.NormalRootNode
 import shark.internal.hppc.LongLongScatterMap
-import shark.internal.hppc.LongScatterSet
 import java.util.ArrayDeque
 import java.util.Deque
 import java.util.LinkedHashMap
@@ -93,15 +93,16 @@ internal class PathFinder(
     val toVisitSet = HashSet<Long>()
     val toVisitLastSet = HashSet<Long>()
 
-    val visitedSet = LongScatterSet()
-
     /**
-     * Map of objects to their leaking dominator.
-     * If an object has been added to [toVisitSet] or [visitedSet] and is missing from
-     * [dominatedObjectIds] then it's considered "undomitable" ie it is dominated by gc roots
-     * and cannot be dominated by a leaking object.
+     * Map of objects to their dominator.
+     * If an object is not in this map then it hasn't been enqueued yet.
+     * If an object is in this map but not in [toVisitSet] nor [toVisitLastSet] then it has
+     * already been dequeued.
+     *
+     * If an object is dominated by more than one GC root then its dominator is set to
+     * [ValueHolder.NULL_REFERENCE].
      */
-    val dominatedObjectIds = LongLongScatterMap()
+    val dominated = LongLongScatterMap()
 
     val queuesNotEmpty: Boolean
       get() = toVisitQueue.isNotEmpty() || toVisitLastQueue.isNotEmpty()
@@ -208,13 +209,6 @@ internal class PathFinder(
     val shortestPathsToLeakingObjects = mutableListOf<ReferencePathNode>()
     visitingQueue@ while (queuesNotEmpty) {
       val node = poll()
-
-      if (checkSeen(node)) {
-        throw IllegalStateException(
-            "Node $node objectId=${node.objectId} should not be enqueued when already visited or enqueued"
-        )
-      }
-
       if (node.objectId in leakingObjectIds) {
         shortestPathsToLeakingObjects.add(node)
         // Found all refs, stop searching (unless computing retained size)
@@ -233,7 +227,7 @@ internal class PathFinder(
         is HeapObjectArray -> visitObjectArray(heapObject, node)
       }
     }
-    return PathFindingResults(shortestPathsToLeakingObjects, dominatedObjectIds)
+    return PathFindingResults(shortestPathsToLeakingObjects, dominated)
   }
 
   private fun State.poll(): ReferencePathNode {
@@ -249,20 +243,12 @@ internal class PathFinder(
     }
   }
 
-  private fun State.checkSeen(node: ReferencePathNode): Boolean {
-    val neverSeen = visitedSet.add(node.objectId)
-    return !neverSeen
-  }
-
   private fun State.enqueueGcRoots() {
     val gcRoots = sortedGcRoots()
 
     val threadNames = mutableMapOf<HeapInstance, String>()
     val threadsBySerialNumber = mutableMapOf<Int, Pair<HeapInstance, ThreadObject>>()
     gcRoots.forEach { (objectRecord, gcRoot) ->
-      if (computeRetainedHeapSize) {
-        undominateWithSkips(gcRoot.id)
-      }
       when (gcRoot) {
         is ThreadObject -> {
           threadsBySerialNumber[gcRoot.threadSerialNumber] = objectRecord.asInstance!! to gcRoot
@@ -274,7 +260,6 @@ internal class PathFinder(
             // Could not find the thread that this java frame is for.
             enqueue(NormalRootNode(gcRoot.id, gcRoot))
           } else {
-
             val (threadInstance, threadRoot) = threadPair
             val threadName = threadNames[threadInstance] ?: {
               val name = threadInstance[Thread::class, "name"]?.value?.readAsJavaString() ?: ""
@@ -392,10 +377,6 @@ internal class PathFinder(
 
       val objectId = staticField.value.asObjectId!!
 
-      if (computeRetainedHeapSize) {
-        undominateWithSkips(objectId)
-      }
-
       val node = when (val referenceMatcher = ignoredStaticFields[fieldName]) {
         null -> NormalNode(
             objectId = objectId,
@@ -443,10 +424,6 @@ internal class PathFinder(
 
     fieldNamesAndValues.forEach { field ->
       val objectId = field.value.asObjectId!!
-      if (computeRetainedHeapSize) {
-        updateDominatorWithSkips(parent.objectId, objectId)
-      }
-
       val node = when (val referenceMatcher = fieldReferenceMatchers[field.name]) {
         null -> NormalNode(
             objectId = objectId,
@@ -479,9 +456,6 @@ internal class PathFinder(
       objectId != ValueHolder.NULL_REFERENCE && graph.objectExists(objectId)
     }
     nonNullElementIds.forEachIndexed { index, elementId ->
-      if (computeRetainedHeapSize) {
-        updateDominatorWithSkips(parent.objectId, elementId)
-      }
       val name = index.toString()
       enqueue(
           NormalNode(
@@ -501,34 +475,44 @@ internal class PathFinder(
     if (node.objectId == ValueHolder.NULL_REFERENCE) {
       return
     }
-    if (visitedSet.contains(node.objectId)) {
-      return
-    }
-    // Already enqueued => shorter or equal distance
-    if (toVisitSet.contains(node.objectId)) {
-      return
-    }
 
     val visitLast =
       visitingLast ||
-      node is LibraryLeakNode ||
+          node is LibraryLeakNode ||
           // We deprioritize thread objects because on Lollipop the thread local values are stored
           // as a field.
           (node is RootNode && node.gcRoot is ThreadObject) ||
           (node is NormalNode && node.parent is RootNode && node.parent.gcRoot is JavaFrame)
 
-    if (toVisitLastSet.contains(node.objectId)) {
-      // Already enqueued => shorter or equal distance amongst library leak ref patterns.
+    val parentObjectId =
+      if (node is RootNode) ValueHolder.NULL_REFERENCE else (node as ChildNode).parent.objectId
+    val alreadyEnqueued = updateDominated(node.objectId, parentObjectId)
+
+    if (alreadyEnqueued) {
+      // Has already been enqueued and would be added to visit last => don't enqueue.
       if (visitLast) {
         return
-      } else {
-        toVisitQueue.add(node)
-        toVisitSet.add(node.objectId)
-        val nodeToRemove = toVisitLastQueue.first { it.objectId == node.objectId }
-        toVisitLastQueue.remove(nodeToRemove)
-        toVisitLastSet.remove(node.objectId)
+      }
+      // Has already been enqueued and exists in the to visit set => don't enqueue
+      if (toVisitSet.contains(node.objectId)) {
         return
       }
+      // Has already been enqueued, is not in toVisitSet, is not in toVisitLast => has been visited
+      if (!toVisitLastSet.contains(node.objectId)) {
+        return
+      }
+    }
+
+    // Because of the checks and return statements right before, from this point on, if
+    // alreadyEnqueued then it's currently enqueued in the visit last set.
+    if (alreadyEnqueued) {
+      // Move from "visit last" to "visit first" queue.
+      toVisitQueue.add(node)
+      toVisitSet.add(node.objectId)
+      val nodeToRemove = toVisitLastQueue.first { it.objectId == node.objectId }
+      toVisitLastQueue.remove(nodeToRemove)
+      toVisitLastSet.remove(node.objectId)
+      return
     }
 
     val isLeakingObject = node.objectId in leakingObjectIds
@@ -539,12 +523,25 @@ internal class PathFinder(
         is HeapInstance ->
           when {
             graphObject.isPrimitiveWrapper -> true
-            graphObject.instanceClassName == "java.lang.String" -> true
+            graphObject.instanceClassName == "java.lang.String" -> {
+              val valueObjectId = graphObject["java.lang.String", "value"]?.value?.asNonNullObjectId
+              if (valueObjectId != null) {
+                updateDominated(valueObjectId, node.objectId)
+              }
+              true
+            }
             graphObject.instanceClass.instanceByteSize <= sizeOfObjectInstances -> true
             else -> false
           }
         is HeapObjectArray -> when {
-          graphObject.isPrimitiveWrapperArray -> true
+          graphObject.isPrimitiveWrapperArray -> {
+            graphObject.readRecord().elementIds.forEach { elementObjectId ->
+              if (elementObjectId != ValueHolder.NULL_REFERENCE) {
+                updateDominated(elementObjectId, node.objectId)
+              }
+            }
+            true
+          }
           else -> false
         }
         is HeapPrimitiveArray -> true
@@ -562,194 +559,81 @@ internal class PathFinder(
     }
   }
 
-  private fun State.updateDominatorWithSkips(
-    parentObjectId: Long,
-    objectId: Long
-  ) {
-
-    when (val graphObject = graph.findObjectById(objectId)) {
-      is HeapClass -> {
-        undominate(objectId, false)
-      }
-      is HeapInstance -> {
-        // String internal array is never enqueued
-        if (graphObject.instanceClassName == "java.lang.String") {
-          updateDominator(parentObjectId, objectId, true)
-          val valueId = graphObject["java.lang.String", "value"]?.value?.asObjectId
-          if (valueId != null) {
-            updateDominator(parentObjectId, valueId, true)
-          }
-        } else {
-          updateDominator(parentObjectId, objectId, false)
-        }
-      }
-      is HeapObjectArray -> {
-        // Primitive wrapper array elements are never enqueued
-        if (graphObject.isPrimitiveWrapperArray) {
-          updateDominator(parentObjectId, objectId, true)
-          for (wrapperId in graphObject.readRecord().elementIds) {
-            updateDominator(parentObjectId, wrapperId, true)
-          }
-        } else {
-          updateDominator(parentObjectId, objectId, false)
-        }
-      }
-      else -> {
-        updateDominator(parentObjectId, objectId, false)
-      }
-    }
-  }
-
-  /**
-   * Every time we find a new object as we traverse the graph, we call this method.
-   *
-   * This is a twist on the traditional dominator tree / retained size algorithms: dominators here
-   * can only be retained instances, which means we don't need to track that many dominators.
-   *
-   * Here's how it works:
-   *
-   * - If [objectId] has no dominator known yet but has already been added to visit, then we know
-   * we've been here for that object already. We did not add this object to the map of dominated
-   * instances in the previous visit so it can't be dominated any more and we can stop there.
-   *
-   * - The parent of [objectId] has already been visited. If that parent is not a retained
-   * instance and has no known retained instance dominator, it cannot be dominated by a retained
-   * instance and therefore [objectId] cannot be dominated either.
-   *
-   * - The potential dominator of [objectId] is: either its parent if that parent is a retained
-   * object, or its parent's dominator (which therefore is a retained object).
-   *
-   * - If [objectId] has no known dominator, we set that potential dominator as its dominator.
-   *
-   * - If [objectId] has a known dominator, we now must find the common parent dominator between
-   * those two dominators. To find that common dominator, we compute the dominator chain for each
-   * dominator and the first found dominator is set as [objectId]'s dominator. If no common
-   * dominator was found, [objectId] cannot be dominated.
-   *
-   * @param neverEnqueued whether [updateDominator] is called right before [objectId] being added
-   * to the queue. There are a number of objects that are never added to the queue because we know
-   * they can't lead to leaks. When we mark objects as undominated and [neverEnqueued] is true,
-   * we also add these objects to visitedSet so that the next visit to [updateDominator] can be
-   * skipped early. If [neverEnqueued] is false then they'll be added to [State.toVisitSet] when
-   * enqueued.
-   */
-  @Suppress("ComplexCondition")
-  private fun State.updateDominator(
-    parent: Long,
+  private fun State.updateDominated(
     objectId: Long,
-    neverEnqueued: Boolean
-  ) {
-    val currentDominatorSlot = dominatedObjectIds.getSlot(objectId)
-    if (currentDominatorSlot == -1 && (objectId in visitedSet || objectId in toVisitSet || objectId in toVisitLastSet)) {
-      return
-    }
-    val parentDominatorSlot = dominatedObjectIds.getSlot(parent)
+    parentObjectId: Long
+  ): Boolean {
+    // This means we can't use "dominated" as meaning "visited". It means "added to one of the queues"
+    val dominatedSlot = dominated.getSlot(objectId)
 
-    val parentIsRetainedObject = parent in leakingObjectIds
+    val alreadyEnqueued = dominatedSlot != -1
 
-    if (!parentIsRetainedObject && parentDominatorSlot == -1) {
-      // parent is not a retained instance and parent has no dominator, but it must have been
-      // visited therefore we know parent belongs to undominated.
-      if (neverEnqueued) {
-        visitedSet.add(objectId)
-      }
+    // TODO Size dominated to be the entire graph when computeRetainedHeapSize is true.
+    // TODO If computeRetainedHeapSize is false, guestimate a size based on a few runs?
+    // TODO Or maybe use a set instead of map when computeRetainedHeapSize false?
 
-      if (currentDominatorSlot != -1) {
-        dominatedObjectIds.remove(objectId)
-      }
-      return
-    }
-    val nextDominator =
-      if (parentIsRetainedObject) parent else dominatedObjectIds.getSlotValue(parentDominatorSlot)
-    if (currentDominatorSlot == -1) {
-      dominatedObjectIds[objectId] = nextDominator
-    } else {
-      val parentDominators = mutableListOf<Long>()
-      val currentDominators = mutableListOf<Long>()
-      var stop = false
-      var dominator: Long = nextDominator
-      while (!stop) {
-        parentDominators.add(dominator)
-        val nextDominatorSlot = dominatedObjectIds.getSlot(dominator)
-        if (nextDominatorSlot == -1) {
-          stop = true
-        } else {
-          dominator = dominatedObjectIds.getSlotValue(nextDominatorSlot)
-        }
-      }
-      stop = false
-      dominator = dominatedObjectIds.getSlotValue(currentDominatorSlot)
-      while (!stop) {
-        currentDominators.add(dominator)
-        val nextDominatorSlot = dominatedObjectIds.getSlot(dominator)
-        if (nextDominatorSlot == -1) {
-          stop = true
-        } else {
-          dominator = dominatedObjectIds.getSlotValue(nextDominatorSlot)
-        }
-      }
-
-      var sharedDominator: Long? = null
-      exit@ for (parentD in parentDominators) {
-        for (currentD in currentDominators) {
-          if (currentD == parentD) {
-            sharedDominator = currentD
-            break@exit
-          }
-        }
-      }
-      if (sharedDominator == null) {
-        dominatedObjectIds.remove(objectId)
-        if (neverEnqueued) {
-          visitedSet.add(objectId)
-        }
+    if (computeRetainedHeapSize) {
+      if (!alreadyEnqueued) {
+        dominated[objectId] = parentObjectId
+      } else if (parentObjectId == ValueHolder.NULL_REFERENCE) {
+        dominated[objectId] = ValueHolder.NULL_REFERENCE
       } else {
-        dominatedObjectIds[objectId] = sharedDominator
-      }
-    }
-  }
-
-  private fun State.undominateWithSkips(objectId: Long) {
-    when (val graphObject = graph.findObjectById(objectId)) {
-      is HeapClass -> {
-        undominate(objectId, false)
-      }
-      is HeapInstance -> {
-        // String internal array is never enqueued
-        if (graphObject.instanceClassName == "java.lang.String") {
-          undominate(objectId, true)
-          val valueId = graphObject["java.lang.String", "value"]?.value?.asObjectId
-          if (valueId != null) {
-            undominate(valueId, true)
+        val currentDominator = dominated.getSlotValue(dominatedSlot)
+        if (currentDominator != ValueHolder.NULL_REFERENCE) {
+          val newDominator = parentObjectId
+          val newDominators = mutableListOf<Long>()
+          val currentDominators = mutableListOf<Long>()
+          var dominator: Long = newDominator
+          // TODO Is there a more efficient version of this that doesn't involve creating two lists
+          // We can definitely skip one list, ie create the first list then do the dominator
+          // computation as we go through the other side. Actually instead of a list
+          // we can build a hash set.
+          // The existing dominator likely has a shortest path, so it should go into the set
+          // that way we build a smaller set, which is faster to query and uses less memory
+          // and we assume we likely don't need to go all the way back.
+          // TODO Write tests before changing impl.
+          while (dominator != ValueHolder.NULL_REFERENCE) {
+            newDominators.add(dominator)
+            val nextDominatorSlot = dominated.getSlot(dominator)
+            if (nextDominatorSlot == -1) {
+              throw IllegalStateException(
+                  "Did not find dominator for $dominator when going through the dominator chain for $newDominator: $newDominators"
+              )
+            } else {
+              dominator = dominated.getSlotValue(nextDominatorSlot)
+            }
           }
-        } else {
-          undominate(objectId, false)
+          dominator = currentDominator
+          while (dominator != ValueHolder.NULL_REFERENCE) {
+            currentDominators.add(dominator)
+            val nextDominatorSlot = dominated.getSlot(dominator)
+            if (nextDominatorSlot == -1) {
+              throw IllegalStateException(
+                  "Did not find dominator for $dominator when going through the dominator chain for $currentDominator: $currentDominators"
+              )
+            } else {
+              dominator = dominated.getSlotValue(nextDominatorSlot)
+            }
+          }
+          var sharedDominator: Long? = null
+          exit@ for (parentD in newDominators) {
+            for (currentD in currentDominators) {
+              if (currentD == parentD) {
+                sharedDominator = currentD
+                break@exit
+              }
+            }
+          }
+          if (sharedDominator == null) {
+            dominated[objectId] = ValueHolder.NULL_REFERENCE
+          } else {
+            dominated[objectId] = sharedDominator
+          }
         }
       }
-      is HeapObjectArray -> {
-        // Primitive wrapper array elements are never enqueued
-        if (graphObject.isPrimitiveWrapperArray) {
-          undominate(objectId, true)
-          for (wrapperId in graphObject.readRecord().elementIds) {
-            undominate(wrapperId, true)
-          }
-        } else {
-          undominate(objectId, false)
-        }
-      }
-      else -> {
-        undominate(objectId, false)
-      }
+    } else {
+      dominated[objectId] = ValueHolder.NULL_REFERENCE
     }
-  }
-
-  private fun State.undominate(
-    objectId: Long,
-    neverEnqueued: Boolean
-  ) {
-    dominatedObjectIds.remove(objectId)
-    if (neverEnqueued) {
-      visitedSet.add(objectId)
-    }
+    return alreadyEnqueued
   }
 }

@@ -43,11 +43,11 @@ import shark.internal.ReferencePathNode.ChildNode
 import shark.internal.ReferencePathNode.LibraryLeakNode
 import shark.internal.ReferencePathNode.RootNode
 import shark.internal.createSHA1Hash
+import shark.internal.hppc.LongLongScatterMap
 import shark.internal.hppc.LongLongScatterMap.ForEachCallback
 import shark.internal.lastSegment
 import java.io.File
 import java.util.ArrayList
-import java.util.LinkedHashMap
 import java.util.concurrent.TimeUnit.NANOSECONDS
 
 /**
@@ -171,8 +171,6 @@ class HeapAnalyzer constructor(
   internal sealed class TrieNode {
     abstract val objectId: Long
 
-    var retainedSize = 0
-
     class ParentNode(override val objectId: Long) : TrieNode() {
       val children = mutableMapOf<Long, TrieNode>()
       override fun toString(): String {
@@ -188,12 +186,11 @@ class HeapAnalyzer constructor(
   }
 
   private fun deduplicateShortestPaths(
-    inputPathResults: List<ReferencePathNode>,
-    retainedSizes: List<Int>?
-  ): List<Pair<ReferencePathNode, Int>> {
+    inputPathResults: List<ReferencePathNode>
+  ): List<ReferencePathNode> {
     val rootTrieNode = ParentNode(0)
 
-    inputPathResults.forEachIndexed { index, pathNode ->
+    inputPathResults.forEach { pathNode ->
       // Go through the linked list of nodes and build the reverse list of instances from
       // root to leaking.
       val path = mutableListOf<Long>()
@@ -203,10 +200,10 @@ class HeapAnalyzer constructor(
         leakNode = leakNode.parent
       }
       path.add(0, leakNode.objectId)
-      updateTrie(pathNode, path, 0, rootTrieNode, retainedSizes?.get(index) ?: 0)
+      updateTrie(pathNode, path, 0, rootTrieNode)
     }
 
-    val outputPathResults = mutableListOf<Pair<ReferencePathNode, Int>>()
+    val outputPathResults = mutableListOf<ReferencePathNode>()
     findResultsInTrie(rootTrieNode, outputPathResults)
     return outputPathResults
   }
@@ -215,32 +212,26 @@ class HeapAnalyzer constructor(
     pathNode: ReferencePathNode,
     path: List<Long>,
     pathIndex: Int,
-    parentNode: ParentNode,
-    retainedSize: Int
+    parentNode: ParentNode
   ) {
     val objectId = path[pathIndex]
     if (pathIndex == path.lastIndex) {
-      // Replace any preexisting children, this is shorter.
-      val previousRetained = parentNode.children[objectId]?.retainedSize ?: 0
-      parentNode.children[objectId] = LeafNode(objectId, pathNode).apply {
-        this.retainedSize = previousRetained + retainedSize
-      }
+      parentNode.children[objectId] = LeafNode(objectId, pathNode)
     } else {
       val childNode = parentNode.children[objectId] ?: {
         val newChildNode = ParentNode(objectId)
         parentNode.children[objectId] = newChildNode
         newChildNode
       }()
-      childNode.retainedSize += retainedSize
       if (childNode is ParentNode) {
-        updateTrie(pathNode, path, pathIndex + 1, childNode, retainedSize)
+        updateTrie(pathNode, path, pathIndex + 1, childNode)
       }
     }
   }
 
   private fun findResultsInTrie(
     parentNode: ParentNode,
-    outputPathResults: MutableList<Pair<ReferencePathNode, Int>>
+    outputPathResults: MutableList<ReferencePathNode>
   ) {
     parentNode.children.values.forEach { childNode ->
       when (childNode) {
@@ -248,18 +239,19 @@ class HeapAnalyzer constructor(
           findResultsInTrie(childNode, outputPathResults)
         }
         is LeafNode -> {
-          outputPathResults += childNode.pathNode to childNode.retainedSize
+          outputPathResults += childNode.pathNode
         }
       }
     }
   }
 
-  private fun FindLeakInput.computeRetainedSizes(pathFindingResults: PathFindingResults): List<Int>? {
+  private fun FindLeakInput.computeRetainedSizes(
+    shortestPaths: List<ShortestPath>,
+    dominatedObjects: LongLongScatterMap
+  ): Map<Long, Int>? {
     if (!computeRetainedHeapSize) {
       return null
     }
-    val pathsToLeakingInstances = pathFindingResults.pathsToLeakingObjects
-    val dominatedInstances = pathFindingResults.dominatedObjectIds
 
     listener.onAnalysisProgress(COMPUTING_NATIVE_RETAINED_SIZE)
 
@@ -302,15 +294,9 @@ class HeapAnalyzer constructor(
 
     listener.onAnalysisProgress(COMPUTING_RETAINED_SIZE)
 
-    val sizeByDominator = LinkedHashMap<Long, Int>().withDefault { 0 }
-
-    // Update sizeByDominator to include self size for leaking instances
-    val leakingInstanceIds = mutableSetOf<Long>()
-    pathsToLeakingInstances.forEach { pathNode ->
-      val leakingInstanceObjectId = pathNode.objectId
-      leakingInstanceIds.add(leakingInstanceObjectId)
-
-      val shallowSize = when (val heapObject = graph.findObjectById(leakingInstanceObjectId)) {
+    val computeSize: (Long) -> Int = { objectId ->
+      val nativeSize = nativeSizes.getValue(objectId)
+      val shallowSize = when (val heapObject = graph.findObjectById(objectId)) {
         is HeapInstance -> heapObject.byteSize
         is HeapObjectArray -> heapObject.readByteSize()
         is HeapPrimitiveArray -> heapObject.readByteSize()
@@ -318,74 +304,77 @@ class HeapAnalyzer constructor(
             "Unexpected class record $heapObject"
         )
       }
-      var retainedSize = sizeByDominator.getValue(leakingInstanceObjectId)
-
-      retainedSize += shallowSize
-      sizeByDominator[leakingInstanceObjectId] = retainedSize
+      nativeSize + shallowSize
     }
 
-    // Compute the size of each dominated instance and add to dominator
-    dominatedInstances.forEach(object : ForEachCallback {
+    val nodeRetainedSizes = mutableMapOf<Long, Int>()
+    nodeRetainedSizes.putAll(
+        shortestPaths.flatMap { path -> path.asList().map { node -> node.objectId to 0 } })
+
+    dominatedObjects.forEach(object : ForEachCallback {
       override fun onEntry(
-        instanceId: Long,
-        dominatorId: Long
+        key: Long,
+        value: Long
       ) {
-        // Avoid double reporting as leakingInstanceIds sizes will move up to the root dominator
-        // We do a separate pass for leakingInstanceIds right before because those are sometimes
-        // part of dominators and sometmes not.
-        if (instanceId !in leakingInstanceIds) {
-          val currentSize = sizeByDominator.getValue(dominatorId)
-          val nativeSize = nativeSizes.getValue(instanceId)
-          val shallowSize = when (val heapObject = graph.findObjectById(instanceId)) {
-            is HeapInstance -> heapObject.byteSize
-            is HeapObjectArray -> heapObject.readByteSize()
-            is HeapPrimitiveArray -> heapObject.readByteSize()
-            is HeapClass -> throw IllegalStateException(
-                "Unexpected class record $heapObject"
-            )
+        if (graph.findObjectById(key) is HeapClass) {
+          return
+        }
+
+        // lazy computing of instance size
+        var instanceSize = -1
+
+        // If the entry is a node, add its size to nodeRetainedSizes
+        nodeRetainedSizes[key]?.let { currentRetainedSize ->
+          instanceSize = computeSize(key)
+          nodeRetainedSizes[key] = currentRetainedSize + instanceSize
+        }
+
+        if (value != ValueHolder.NULL_REFERENCE) {
+          var dominator = value
+          val dominatedByNextNode = mutableListOf(key)
+          while (dominator != ValueHolder.NULL_REFERENCE) {
+            // If dominator is a node
+            if (nodeRetainedSizes.containsKey(dominator)) {
+              // Update dominator for all objects in the dominator path so far to directly point
+              // to it. We're compressing the dominator path to make this iteration faster and
+              // faster as we go through each entry.
+              dominatedByNextNode.forEach { objectId ->
+                dominatedObjects[objectId] = dominator
+              }
+              if (instanceSize == -1) {
+                instanceSize = computeSize(key)
+              }
+              // Update retained size for that node
+              val currentRetainedSize = nodeRetainedSizes.getValue(dominator)
+              nodeRetainedSizes[dominator] = currentRetainedSize + instanceSize
+              dominatedByNextNode.clear()
+            } else {
+              dominatedByNextNode += dominator
+            }
+            dominator = dominatedObjects[dominator]
           }
-          sizeByDominator[dominatorId] = currentSize + nativeSize + shallowSize
+          // Update all dominator for all objects found in the dominator path after the last node
+          dominatedByNextNode.forEach { objectId ->
+            dominatedObjects[objectId] = ValueHolder.NULL_REFERENCE
+          }
         }
       }
     })
+    dominatedObjects.release()
 
-    // Move retained sizes from dominated leaking instance to dominators leaking instances.
-    // Keep doing this until nothing moves.
-    var sizedMoved: Boolean
-    do {
-      sizedMoved = false
-      pathsToLeakingInstances.map { it.objectId }
-          .forEach { leakingInstanceId ->
-            val dominatorSlot = dominatedInstances.getSlot(leakingInstanceId)
-            if (dominatorSlot != -1) {
-              val dominator = dominatedInstances.getSlotValue(dominatorSlot)
-              val retainedSize = sizeByDominator.getValue(leakingInstanceId)
-              if (retainedSize > 0) {
-                sizeByDominator[leakingInstanceId] = 0
-                val dominatorRetainedSize = sizeByDominator.getValue(dominator)
-                sizeByDominator[dominator] = retainedSize + dominatorRetainedSize
-                sizedMoved = true
-              }
-            }
-          }
-    } while (sizedMoved)
-    dominatedInstances.release()
-    return pathsToLeakingInstances.map { pathNode ->
-      sizeByDominator[pathNode.objectId]!!
-    }
+    return nodeRetainedSizes
+  }
+
+  internal class ShortestPath(
+    val root: RootNode,
+    val childPath: List<ChildNode>
+  ) {
+    fun asList() = listOf(root) + childPath
   }
 
   private fun FindLeakInput.buildLeakTraces(pathFindingResults: PathFindingResults): Pair<List<ApplicationLeak>, List<LibraryLeak>> {
-    val retainedSizes = computeRetainedSizes(pathFindingResults)
-
-    listener.onAnalysisProgress(BUILDING_LEAK_TRACES)
-
-    val applicationLeaksMap = mutableMapOf<String, MutableList<LeakTrace>>()
-    val libraryLeaksMap =
-      mutableMapOf<String, Pair<LibraryLeakReferenceMatcher, MutableList<LeakTrace>>>()
-
     val deduplicatedPaths =
-      deduplicateShortestPaths(pathFindingResults.pathsToLeakingObjects, retainedSizes)
+      deduplicateShortestPaths(pathFindingResults.pathsToLeakingObjects)
 
     if (deduplicatedPaths.size != pathFindingResults.pathsToLeakingObjects.size) {
       SharkLog.d {
@@ -396,7 +385,7 @@ class HeapAnalyzer constructor(
       SharkLog.d { "Found ${deduplicatedPaths.size} paths to retained objects" }
     }
 
-    deduplicatedPaths.forEachIndexed { index, (retainedObjectNode, retainedSize) ->
+    val shortestPaths = deduplicatedPaths.map { retainedObjectNode ->
       val shortestChildPath = mutableListOf<ChildNode>()
       var node = retainedObjectNode
       while (node is ChildNode) {
@@ -405,21 +394,35 @@ class HeapAnalyzer constructor(
       }
       val rootNode = node as RootNode
 
-      val shortestPath = listOf(rootNode) + shortestChildPath
+      ShortestPath(rootNode, shortestChildPath)
+    }
 
-      val leakTraceObjects = buildLeakTraceObjects(objectInspectors, shortestPath)
+    val retainedSizes =
+      computeRetainedSizes(shortestPaths, pathFindingResults.dominatedObjectIds)
 
-      val referencePath = buildReferencePath(shortestChildPath, leakTraceObjects)
+    listener.onAnalysisProgress(BUILDING_LEAK_TRACES)
+
+    val applicationLeaksMap = mutableMapOf<String, MutableList<LeakTrace>>()
+    val libraryLeaksMap =
+      mutableMapOf<String, Pair<LibraryLeakReferenceMatcher, MutableList<LeakTrace>>>()
+
+    shortestPaths.forEach { shortestPath ->
+      val shortestPathList = shortestPath.asList()
+
+      val leakTraceObjects =
+        buildLeakTraceObjects(objectInspectors, shortestPathList, retainedSizes)
+
+      val referencePath = buildReferencePath(shortestPath.childPath, leakTraceObjects)
 
       val leakTrace = LeakTrace(
-          gcRootType = GcRootType.fromGcRoot(rootNode.gcRoot),
+          gcRootType = GcRootType.fromGcRoot(shortestPath.root.gcRoot),
           referencePath = referencePath,
           leakingObject = leakTraceObjects.last(),
-          retainedHeapByteSize = if (retainedSizes == null) null else retainedSize
+          retainedHeapByteSize = if (retainedSizes == null) null else retainedSizes[shortestPathList.last().objectId]
       )
 
       val firstLibraryLeakNode =
-        shortestPath.firstOrNull { it is LibraryLeakNode } as LibraryLeakNode?
+        shortestPathList.firstOrNull { it is LibraryLeakNode } as LibraryLeakNode?
 
       if (firstLibraryLeakNode != null) {
         val matcher = firstLibraryLeakNode.matcher
@@ -443,7 +446,8 @@ class HeapAnalyzer constructor(
 
   private fun FindLeakInput.buildLeakTraceObjects(
     objectInspectors: List<ObjectInspector>,
-    shortestPath: List<ReferencePathNode>
+    shortestPath: List<ReferencePathNode>,
+    retainedSizes: Map<Long, Int>?
   ): List<LeakTraceObject> {
     val pathHeapObjects = shortestPath.map { graph.findObjectById(it.objectId) }
 
@@ -462,6 +466,9 @@ class HeapAnalyzer constructor(
 
     return pathHeapObjects.mapIndexed { index, heapObject ->
       val leakReporter = leakReporters[index]
+      if (retainedSizes != null) {
+        leakReporter.labels += "Retaining ${retainedSizes[heapObject.objectId]} bytes"
+      }
       val nextNode = if (index + 1 < shortestPath.size) {
         shortestPath[index + 1]
       } else {
